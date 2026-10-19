@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+!.env.local.example
+*.sqlite3
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.next/
+.vercel/
+*.dump
+*.age

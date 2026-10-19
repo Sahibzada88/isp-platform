@@ -1,0 +1,52 @@
+# Daily encrypted pg_dump -> Google Drive (via rclone).
+# SAFE REPLACE: old backups are deleted only after the new one is uploaded AND verified.
+# Any failing step stops the job (set -e) before the delete step, so the old backup stays.
+name: database-backup
+on:
+  schedule: [{ cron: "30 21 * * *" }]   # 02:30 PKT
+  workflow_dispatch: {}
+env:
+  KEEP: 1            # how many backups to keep (newest first). 1 = only the latest.
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17 age rclone
+      - name: Dump, verify, encrypt, upload, verify upload, then prune
+        env:
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+          AGE_PUBLIC_KEY: ${{ secrets.BACKUP_AGE_PUBLIC_KEY }}
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_SCOPE: drive
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_RCLONE_TOKEN }}
+          RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_BACKUP_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          [ "$KEEP" -ge 1 ] || { echo "KEEP must be >= 1"; exit 1; }
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          plain="isp-$stamp.dump"; f="$plain.age"
+
+          # 1. dump and check the dump is readable before trusting it
+          pg_dump --format=custom --no-owner --no-privileges "$DIRECT_DATABASE_URL" > "$plain"
+          [ "$(stat -c%s "$plain")" -gt 10000 ] || { echo "dump suspiciously small"; exit 1; }
+          pg_restore --list "$plain" > /dev/null
+
+          # 2. encrypt (plain file is removed immediately)
+          age -r "$AGE_PUBLIC_KEY" -o "$f" "$plain" && rm -f "$plain"
+
+          # 3. upload, then compare checksums of local and remote copies
+          rclone copyto "$f" "gdrive:$f"
+          local_md5=$(md5sum "$f" | cut -d' ' -f1)
+          remote_md5=$(rclone hashsum MD5 "gdrive:$f" | cut -d' ' -f1)
+          [ "$local_md5" = "$remote_md5" ] || { echo "upload verification FAILED - keeping old backups"; exit 1; }
+          echo "uploaded and verified: $f"
+
+          # 4. only now delete older backups, keeping the newest $KEEP (never touches the new file)
+          rclone lsf gdrive: --files-only | grep -E '^isp-.*\.dump\.age$' | sort -r | tail -n +$((KEEP+1)) | while read -r old; do
+            [ "$old" != "$f" ] && { echo "removing old backup $old"; rclone deletefile "gdrive:$old"; }
+          done
+      # A failed run turns the workflow red; enable GitHub failure e-mails for alerting.

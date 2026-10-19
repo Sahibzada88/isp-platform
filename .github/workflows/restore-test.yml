@@ -1,0 +1,37 @@
+# Monthly restore test: a backup is only trusted once it has been restored.
+name: backup-restore-test
+on:
+  schedule: [{ cron: "0 22 1 * *" }]
+  workflow_dispatch: {}
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    services:
+      pg:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: restore, POSTGRES_DB: restore }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-retries 10
+    steps:
+      - run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17 age rclone
+      - name: Fetch newest backup, decrypt, restore, sanity-check
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.BACKUP_AGE_PRIVATE_KEY }}
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_SCOPE: drive
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_RCLONE_TOKEN }}
+          RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_BACKUP_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          latest=$(rclone lsf gdrive: --files-only | grep -E '^isp-.*\.dump\.age$' | sort | tail -1)
+          [ -n "$latest" ] || { echo "no backup found"; exit 1; }
+          rclone copyto "gdrive:$latest" backup.age
+          printf '%s' "$AGE_PRIVATE_KEY" > key.txt
+          age -d -i key.txt backup.age > backup.dump && rm key.txt
+          pg_restore --no-owner -d "postgresql://postgres:restore@localhost:5432/restore" backup.dump
+          psql "postgresql://postgres:restore@localhost:5432/restore" -c \
+            "SELECT 'customers', count(*) FROM customers_customer UNION ALL SELECT 'audit', count(*) FROM audit_auditlog;"
